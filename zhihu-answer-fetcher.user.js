@@ -145,6 +145,25 @@
     unsafeWindow.fetch = async function (input, init) {
       const url = typeof input === 'string' ? input : (input?.url || String(input));
 
+      // 只要是知乎的请求，且尚未捕获到 headers，就尝试捕获（解决在单回答页面等无 feeds 列表的页面无法直连的问题）
+      if (!capturedHdrs && (url.includes('zhihu.com') || url.startsWith('/'))) {
+        try {
+          const h = init?.headers;
+          const tempHdrs = h instanceof Headers ? Object.fromEntries(h.entries()) : (h ? { ...h } : {});
+          const keys = Object.keys(tempHdrs);
+          const hasAuth = keys.some(k => ['cookie', 'authorization', 'x-zse-96', 'x-xsrf-token'].includes(k.toLowerCase()));
+          if (hasAuth || keys.length > 3) {
+            capturedHdrs = tempHdrs;
+            console.log('[ZF v1.0] 💡 通过其他知乎 API 预先捕获到请求头');
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      // 【调试日志】方便排查接口变动
+      if (url.includes('question') || url.includes('answers') || url.includes('feeds')) {
+        console.log('[ZhihuFetcher Debug] 拦截到 fetch 请求:', url);
+      }
+
       const isFeeds   = FEEDS_RE.test(url);
       const isAnswers = ANSWERS_RE.test(url) && !url.includes('/comments');
 
