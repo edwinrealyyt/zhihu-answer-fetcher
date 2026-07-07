@@ -4,6 +4,7 @@
 // @version      1.0.0
 // @description  知乎回答与评论全量获取助手，支持按点赞数/时间排序，让知乎内容阅读与分析更高效。
 // @author       EdwinYyt
+// @license      MIT
 // @match        https://www.zhihu.com/question/*
 // @grant        unsafeWindow
 // @grant        GM_addStyle
