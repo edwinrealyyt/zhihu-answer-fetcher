@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         知乎小助手
 // @namespace    https://github.com/yourname/zhihu-answer-fetcher
-// @version      1.0.0
-// @description  知乎回答与评论全量获取助手，支持按点赞数/时间排序，让知乎内容阅读与分析更高效。
+// @version      1.0.1
+// @description  知乎网页端回答与评论获取助手，告别手动加载刷新，支持回答按点赞数/时间排序。
 // @author       EdwinYyt
 // @license      MIT
 // @match        https://www.zhihu.com/question/*
@@ -100,7 +100,7 @@
     ZfIO.prototype = _Orig.prototype;
     Object.setPrototypeOf(ZfIO, _Orig);
     unsafeWindow.IntersectionObserver = ZfIO;
-    console.log('[ZF v0.9] ✅ IntersectionObserver hook OK');
+    console.log('[ZF v1.0] ✅ IntersectionObserver hook OK');
   })();
 
   function fireAllIO() {
@@ -120,12 +120,12 @@
             rootBounds: null, target: el, time: now
           }], t.io);
           fired++;
-        } catch (e) { console.warn('[ZF v0.9] IO cb error:', e.message); }
+        } catch (e) { console.warn('[ZF v1.0] IO cb error:', e.message); }
         break;
       }
     }
     if (fired) cntIO++;
-    console.log(`[ZF v0.9] IO fire: ${fired}/${ioTrackers.length}`);
+    console.log(`[ZF v1.0] IO fire: ${fired}/${ioTrackers.length}`);
     return fired > 0;
   }
 
@@ -150,7 +150,7 @@
 
       if (!isFeeds && !isAnswers) return _origFetch(input, init);
 
-      console.log('[ZF v0.9] ▶', isFeeds ? 'feeds' : 'answers', url.slice(0, 100));
+      console.log('[ZF v1.0] ▶', isFeeds ? 'feeds' : 'answers', url.slice(0, 100));
 
       // 捕获请求头供直连复用
       try {
@@ -183,14 +183,14 @@
       }
 
       rawAnswers.push(...batch);
-      console.log(`[ZF v0.9] 被动 +${batch.length} | 累计 ${rawAnswers.length}`);
+      console.log(`[ZF v1.0] 被动 +${batch.length} | 累计 ${rawAnswers.length}`);
       onBatchReceived(batch.length, rawAnswers.length, false, isFeeds ? '被动/feeds' : '被动/answers');
 
       await new Promise(r => setTimeout(r, 100));
       return realResp;
     };
 
-    console.log('[ZF v0.9] ✅ fetch hook OK, QID=' + QID);
+    console.log('[ZF v1.0] ✅ fetch hook OK, QID=' + QID);
   })();
 
   // feeds item → answer object
@@ -242,11 +242,11 @@
       + `?include=${ANS_INCLUDE}&limit=20&offset=${currentOffset}&platform=desktop&sort_by=default`;
 
     try {
-      console.log(`[ZF v0.9] → answers API offset=${currentOffset}${isRetryingFailed ? ' (重试)' : ''}`);
+      console.log(`[ZF v1.0] → answers API offset=${currentOffset}${isRetryingFailed ? ' (重试)' : ''}`);
       const resp = await _origFetch(url, { method: 'GET', headers: capturedHdrs, credentials: 'include', mode: 'cors' });
 
       if (!resp.ok) {
-        console.warn(`[ZF v0.9] answers API HTTP ${resp.status}`);
+        console.warn(`[ZF v1.0] answers API HTTP ${resp.status}`);
         answersApiFailed++;
         if (!isRetryingFailed) failedOffsets.push(currentOffset); // 压入重试队列
         return false;
@@ -271,11 +271,11 @@
       }
 
       cntDirect++;
-      console.log(`[ZF v0.9] ✅ answers直连 +${batch.length} offset=${currentOffset} end=${answersDone}`);
+      console.log(`[ZF v1.0] ✅ answers直连 +${batch.length} offset=${currentOffset} end=${answersDone}`);
       onBatchReceived(batch.length, rawAnswers.length, answersDone, '直连/answers');
       return true;
     } catch (e) {
-      console.warn('[ZF v0.9] answers直连异常:', e.message);
+      console.warn('[ZF v1.0] answers直连异常:', e.message);
       answersApiFailed++;
       if (!isRetryingFailed) failedOffsets.push(currentOffset);
       return false;
@@ -298,7 +298,7 @@
     try {
       const resp = await _origFetch(feedsNextUrl, { method: 'GET', headers: capturedHdrs, credentials: 'include', mode: 'cors' });
       if (!resp.ok) {
-        console.warn(`[ZF v0.9] feeds API HTTP ${resp.status}`);
+        console.warn(`[ZF v1.0] feeds API HTTP ${resp.status}`);
         feedsApiFailed++;
         return false;
       }
@@ -322,7 +322,7 @@
       onBatchReceived(batch.length, rawAnswers.length, false, '直连/feeds');
       return true;
     } catch (e) {
-      console.warn('[ZF v0.9] feeds直连异常:', e.message);
+      console.warn('[ZF v1.0] feeds直连异常:', e.message);
       feedsApiFailed++;
       return false;
     } finally {
@@ -388,7 +388,7 @@
       if (Date.now() - lastDataTs < TIMEOUT) return;
       retryCount++;
       if (retryCount > MAX) { clearInterval(watchdogTimer); onFetchComplete(true); return; }
-      console.log(`[ZF v0.9] 看门狗 retry ${retryCount}/${MAX}`);
+      console.log(`[ZF v1.0] 看门狗 retry ${retryCount}/${MAX}`);
       lastDataTs = Date.now();
       updateStatus(`⚠️ 重试 ${retryCount}/${MAX}...`);
       unsafeWindow.scrollTo({ top: 0 });
@@ -851,7 +851,7 @@
           openCommentModal(answerId, commentCount, authorName);
         };
       }
-      console.error('[ZF v0.9] 评论加载失败:', e);
+      console.error('[ZF v1.0] 评论加载失败:', e);
     }
   }
 
@@ -1564,7 +1564,7 @@ function buildCommentSection(json, answerId, startOffset) {
     el.id = 'zf-panel';
     el.innerHTML = `
       <h3 id="zf-title">
-        <span style="display: flex; align-items: center; gap: 4px;">📦 知乎回答抓取 v1.0.0</span>
+        <span style="display: flex; align-items: center; gap: 4px;">📦 知乎回答抓取 v1.0.1</span>
         <div style="display: flex; align-items: center; gap: 8px;">
           <span id="zf-theme-toggle" style="cursor: pointer; font-size: 12px; transition: transform 0.2s;" title="切换配色">☀️</span>
           <span id="zf-collapse-indicator">▾</span>
@@ -1749,7 +1749,7 @@ function buildCommentSection(json, answerId, startOffset) {
     ov.id = 'zf-debug-overlay';
     ov.innerHTML = `
       <button id="zf-debug-close">✕</button>
-      <h4>🔍 ZhihuFetcher v0.9 调试面板</h4>
+      <h4>🔍 ZhihuFetcher v1.0.1 调试面板</h4>
       <div class="dbg-sec">
         <div class="dbg-lbl">Hook 状态</div>
         <pre>fetch hook:    ${!!unsafeWindow.__ZF_FETCH_HOOKED__}
@@ -2133,5 +2133,5 @@ ${topDupsStr || '  (暂无重复回答)'}</pre>
     }
   });
 
-  console.log(`[ZhihuFetcher] v0.9 初始化完成，QID=${QID}`);
+  console.log(`[ZhihuFetcher] v1.0.1 初始化完成，QID=${QID}`);
 })();
