@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         知乎小助手
+// @name         知乎控制器
 // @namespace    https://github.com/yourname/zhihu-answer-fetcher
 // @version      1.0.1
-// @description  知乎网页端回答与评论获取助手，告别手动加载刷新，支持回答按点赞数/时间排序。
+// @description  知乎网页端太难用了，加载慢，排序乱，真得控制一下你了。知乎网页端回答与评论获取助手，告别手动加载刷新，支持回答按点赞数/时间排序。
 // @author       EdwinYyt
 // @license      MIT
 // @match        https://www.zhihu.com/question/*
@@ -1564,7 +1564,7 @@ function buildCommentSection(json, answerId, startOffset) {
     el.id = 'zf-panel';
     el.innerHTML = `
       <h3 id="zf-title">
-        <span style="display: flex; align-items: center; gap: 4px;">📦 知乎回答抓取 v1.0.1</span>
+        <span style="display: flex; align-items: center; gap: 4px;">🛠️ 知乎控制器 v1.0.1</span>
         <div style="display: flex; align-items: center; gap: 8px;">
           <span id="zf-theme-toggle" style="cursor: pointer; font-size: 12px; transition: transform 0.2s;" title="切换配色">☀️</span>
           <span id="zf-collapse-indicator">▾</span>
@@ -1812,7 +1812,7 @@ ${topDupsStr || '  (暂无重复回答)'}</pre>
         <button id="zf-donate-close" style="position: absolute; top: 12px; right: 16px; cursor: pointer; background: none; border: none; color: #ef4444; font-size: 24px; line-height: 1; padding: 0;">✕</button>
         <h4 style="margin: 0 0 12px; font-size: 16px; text-align: center; font-weight: bold; color: ${isLight ? '#4f46e5' : '#60a5fa'};">☕ 赞助支持</h4>
         <p style="margin: 0 0 20px; font-size: 13px; color: ${subColor}; text-align: center; line-height: 1.6; padding: 0 8px;">
-          如果您觉得「知乎小助手」对您有所帮助，欢迎请作者喝杯咖啡！您的支持是持续优化与维护的动力。
+          如果您觉得「知乎控制器」对您有所帮助，欢迎请作者喝杯咖啡！您的支持是持续优化与维护的动力。
         </p>
         
         <div style="display: flex; gap: 20px; justify-content: center; flex-wrap: wrap;">
@@ -1897,7 +1897,7 @@ ${topDupsStr || '  (暂无重复回答)'}</pre>
     resultEl.id = 'zf-result';
     resultEl.innerHTML = `
       <div class="zf-result-header">
-        <span>📦 脚本渲染（${modeLabel}）—— 共 ${currentSorted.length} 条 | 每页 ${itemsPerPage} 条</span>
+        <span>🛠️ 脚本渲染（${modeLabel}）—— 共 ${currentSorted.length} 条 | 每页 ${itemsPerPage} 条</span>
         <button id="zf-img-toggle" class="zf-img-toggle">${showImages ? '🖼 隐藏图片' : '🖼 显示图片'}</button>
       </div>
       <div id="zf-pg-top"></div>
