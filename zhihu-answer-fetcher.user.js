@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎控制器
-// @namespace    https://github.com/yourname/zhihu-answer-fetcher
-// @version      1.0.1
+// @namespace    https://github.com/edwinrealyyt/zhihu-answer-fetcher
+// @version      1.0.2
 // @description  知乎网页端太难用了，加载慢，排序乱，真得控制一下你了。知乎网页端回答与评论获取助手，告别手动加载刷新，支持回答按点赞数/时间排序。
 // @author       EdwinYyt
 // @license      MIT
@@ -28,6 +28,7 @@
   let rawAnswers    = [];
   let allAnswers    = [];
   let isFetching    = false;
+  let totalAnswersCount = null;
   let isRequesting  = false;  // 防并发锁
   let activeRequests = 0;     // 当前活跃请求数
   const MAX_CONCURRENCY = 2;  // 最大并发通道数
@@ -193,12 +194,18 @@
         }
         feedsNextUrl = json.paging?.next || null;
         if (json.paging?.is_end) feedsDone = true;
+        if (json.paging?.totals) {
+          totalAnswersCount = parseInt(json.paging.totals, 10) || totalAnswersCount;
+        }
       } else {
         // answers 结构：item 直接就是回答对象
         for (const item of (json.data || [])) {
           if (isAnswerObject(item)) batch.push(item);
         }
         if (json.paging?.is_end) answersDone = true;
+        if (json.paging?.totals) {
+          totalAnswersCount = parseInt(json.paging.totals, 10) || totalAnswersCount;
+        }
       }
 
       rawAnswers.push(...batch);
@@ -281,6 +288,9 @@
       answersApiFailed = 0; // 重置失败计数
       const batch = json.data.filter(isAnswerObject);
       rawAnswers.push(...batch);
+      if (json.paging?.totals) {
+        totalAnswersCount = parseInt(json.paging.totals, 10) || totalAnswersCount;
+      }
 
       // 到头判定：当前返回是 is_end，且没有积压的重试任务时，才算真正 Done
       if (json.paging?.is_end || (batch.length === 0 && !isRetryingFailed)) {
@@ -336,6 +346,9 @@
       rawAnswers.push(...batch);
       feedsNextUrl = json.paging?.next || null;
       if (json.paging?.is_end) feedsDone = true;
+      if (json.paging?.totals) {
+        totalAnswersCount = parseInt(json.paging.totals, 10) || totalAnswersCount;
+      }
 
       cntDirect++;
       onBatchReceived(batch.length, rawAnswers.length, false, '直连/feeds');
@@ -488,6 +501,15 @@
   // ═══════════════════════════════════════════════════════════
   // § 6. 抓取控制
   // ═══════════════════════════════════════════════════════════
+  function getInitialAnswerCount() {
+    const meta = document.querySelector('meta[itemprop="answerCount"]');
+    if (meta) {
+      const val = parseInt(meta.getAttribute('content'), 10);
+      if (!isNaN(val) && val > 0) return val;
+    }
+    return null;
+  }
+
   async function onFetchAll() {
     if (isFetching) return;
     isFetching = true; retryCount = 0; cntDirect = 0; cntIO = 0;
@@ -497,6 +519,7 @@
     rawAnswers = []; allAnswers = [];
     feedsNextUrl = null; feedsDone = false; feedsApiFailed = 0;
     answersOffset = 0; answersDone = false; answersApiFailed = 0;
+    totalAnswersCount = getInitialAnswerCount();
 
     setSortEnabled(false); updateCount(0);
     const btn = document.getElementById('zf-btn-fetch');
@@ -555,27 +578,99 @@
     return resp.json();
   }
 
-  async function loadAllComments(answerId) {
+  async function loadAllComments(answerId, onProgress) {
     let allData = [];
-    let offset = 0;
-    let isEnd = false;
-    let maxRequests = 40; 
-    let reqCount = 0;
-
-    while (!isEnd && reqCount < maxRequests) {
-      const json = await loadComments(answerId, offset);
-      if (json.data && Array.isArray(json.data)) {
-        allData.push(...json.data);
+    
+    // 1. 获取第一页以得到总数和初始批次
+    const firstPage = await loadComments(answerId, 0);
+    const total = firstPage.paging?.totals || 0;
+    const initialBatch = firstPage.data || [];
+    
+    const resultsMap = new Map();
+    resultsMap.set(0, initialBatch);
+    
+    let completedCount = initialBatch.length;
+    if (onProgress) {
+      onProgress(completedCount, total);
+    }
+    
+    const isEnd = firstPage.paging?.is_end ?? true;
+    if (isEnd || completedCount >= total) {
+      return {
+        data: initialBatch,
+        paging: { is_end: true, totals: initialBatch.length }
+      };
+    }
+    
+    // 2. 生成需要拉取的 offset 列表
+    const limit = 20;
+    const offsets = [];
+    const maxComments = 1000; // 限制最多只拉取前1000条评论，防止耗时过长或内存溢出
+    for (let offset = initialBatch.length; offset < Math.min(total, maxComments); offset += limit) {
+      offsets.push(offset);
+    }
+    
+    if (offsets.length === 0) {
+      return {
+        data: initialBatch,
+        paging: { is_end: true, totals: initialBatch.length }
+      };
+    }
+    
+    // 3. 并发拉取剩余的评论页，控制并发数为 3
+    const CONCURRENCY = 3;
+    let activeRequests = 0;
+    let cursor = 0;
+    let hasError = false;
+    let errorMsg = '';
+    
+    await new Promise((resolve, reject) => {
+      const next = async () => {
+        if (hasError) {
+          reject(new Error(errorMsg));
+          return;
+        }
+        if (cursor >= offsets.length) {
+          if (activeRequests === 0) resolve();
+          return;
+        }
+        
+        const currentOffset = offsets[cursor++];
+        activeRequests++;
+        
+        try {
+          await new Promise(r => setTimeout(r, 60)); // 错开微小延迟，防止触发知乎安全频控
+          const json = await loadComments(answerId, currentOffset);
+          const batch = json.data || [];
+          resultsMap.set(currentOffset, batch);
+          
+          completedCount += batch.length;
+          if (onProgress) {
+            onProgress(completedCount, total);
+          }
+        } catch (e) {
+          hasError = true;
+          errorMsg = e.message || '加载评论失败';
+        } finally {
+          activeRequests--;
+          next();
+        }
+      };
+      
+      for (let i = 0; i < Math.min(CONCURRENCY, offsets.length); i++) {
+        next();
       }
-      isEnd = json.paging?.is_end ?? true;
-      if (!isEnd) {
-        offset += json.data?.length ?? 20;
-      }
-      reqCount++;
-      if (!isEnd) {
-        await new Promise(r => setTimeout(r, 120));
+    });
+    
+    // 4. 按 offset 升序重组评论，保持原始顺序
+    const sortedOffsets = [0, ...offsets].sort((a, b) => a - b);
+    for (const offset of sortedOffsets) {
+      const batch = resultsMap.get(offset);
+      if (batch) {
+        allData.push(...batch);
       }
     }
+    
     return {
       data: allData,
       paging: { is_end: true, totals: allData.length }
@@ -639,8 +734,13 @@
     body.className = 'zf-modal-body';
 
     const loadingDiv = document.createElement('div');
-    loadingDiv.style.cssText = 'text-align:center; padding:50px 0; color:#8e8e93; font-size:13px;';
-    loadingDiv.innerHTML = '⏳ 正在加载评论...';
+    loadingDiv.style.cssText = 'text-align:center; padding:50px 0; color:#8e8e93; font-size:13px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px;';
+    loadingDiv.innerHTML = `
+      <div id="zf-modal-loading-text">⏳ 正在加载评论...</div>
+      <div style="width:240px; height:6px; background:#e2e8f0; border-radius:3px; overflow:hidden; margin:0 auto;">
+        <div id="zf-modal-loading-bar" style="width:0%; height:100%; background:linear-gradient(90deg,#7c3aed,#a78bfa); transition:width 0.2s ease;"></div>
+      </div>
+    `;
     body.appendChild(loadingDiv);
     container.appendChild(body);
     modal.appendChild(container);
@@ -670,7 +770,19 @@
     document.addEventListener('keydown', escHandler);
 
     try {
-      const json = await loadAllComments(answerId);
+      const updateModalProgress = (loaded, total) => {
+        const textEl = document.getElementById('zf-modal-loading-text');
+        const barEl = document.getElementById('zf-modal-loading-bar');
+        const percentage = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+        if (textEl) {
+          textEl.textContent = `⏳ 正在加载评论数据: ${loaded} / ${total || '?'} (${percentage}%)`;
+        }
+        if (barEl) {
+          barEl.style.width = `${percentage}%`;
+        }
+      };
+
+      const json = await loadAllComments(answerId, updateModalProgress);
 
       // 统一的名字获取器，兼容不同版本的接口作者名字封装
       const getAuthorName = (c) => {
@@ -779,7 +891,20 @@
 
         // 3. 执行补全拉取
         if (pendingNodes.length > 0) {
-          loadingDiv.innerHTML = `⏳ 正在后台自动补全二级回复 (0/${pendingNodes.length})...`;
+          const totalNodes = pendingNodes.length;
+          const updateChildProgress = (comp, tot) => {
+            const textEl = document.getElementById('zf-modal-loading-text');
+            const barEl = document.getElementById('zf-modal-loading-bar');
+            const percentage = tot > 0 ? Math.min(100, Math.round((comp / tot) * 100)) : 0;
+            if (textEl) {
+              textEl.textContent = `⏳ 正在补全二级回复: ${comp} / ${tot} (${percentage}%)`;
+            }
+            if (barEl) {
+              barEl.style.width = `${percentage}%`;
+            }
+          };
+
+          updateChildProgress(0, totalNodes);
           
           let completed = 0;
           let activeChildRequests = 0;
@@ -836,7 +961,7 @@
               } finally {
                 completed++;
                 activeChildRequests--;
-                loadingDiv.innerHTML = `⏳ 正在后台自动补全二级回复 (${completed}/${pendingNodes.length})...`;
+                updateChildProgress(completed, totalNodes);
                 next();
               }
             };
@@ -1722,9 +1847,13 @@ function buildCommentSection(json, answerId, startOffset) {
   function updateStatus(t) { const el = document.getElementById('zf-status'); if (el) el.innerHTML = t; }
   function updateCount(n) {
     const el = document.getElementById('zf-count');
-    if (el) el.textContent = n > 0 ? `已截获 ${n} 条` : '';
+    const totalText = totalAnswersCount ? ` / ${totalAnswersCount}` : '';
+    if (el) el.textContent = n > 0 ? `已截获 ${n}${totalText} 条` : '';
     const bar = document.getElementById('zf-progress-bar');
-    if (bar) bar.style.width = Math.min(100, (n / 1000) * 100) + '%';
+    if (bar) {
+      const total = totalAnswersCount || Math.max(1000, n);
+      bar.style.width = Math.min(100, (n / total) * 100) + '%';
+    }
   }
   function setSortEnabled(on) {
     ['zf-btn-votes','zf-btn-newest','zf-btn-oldest','zf-btn-restore'].forEach(id => {
