@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎控制器
 // @namespace    https://github.com/edwinrealyyt/zhihu-answer-fetcher
-// @version      1.0.2
+// @version      1.0.3
 // @description  知乎网页端太难用了，加载慢，排序乱，真得控制一下你了。知乎网页端回答与评论获取助手，告别手动加载刷新，支持回答按点赞数/时间排序。
 // @author       EdwinYyt
 // @license      MIT
@@ -16,6 +16,7 @@
 
   const QID = location.pathname.match(/\/question\/(\d+)/)?.[1];
   if (!QID) return;
+  const VERSION = '1.0.3';
 
   // 赞助收款码配置（支持在线图片 URL 或 Base64 编码，留空则显示配置提示）
   const WECHAT_QR = 'https://g.imgtg.com/uploads/10010/6a4c781c564cd.png';  // 微信收款码
@@ -1051,29 +1052,50 @@
     allFlatComments.forEach(c => {
       const idStr = String(c.id);
       const parentId = c.reply_comment_id || c.reply_to_comment?.id || c.reply_to_comment_id || c.reply_root_comment_id || c.root_comment_id;
+      const replyAuthorName = c.reply_to_author?.member?.name || c.reply_to_author?.name;
+      
+      let pIdStr = null;
+      let placeholderAuthor = '知乎用户';
+      let isSynthesized = false;
       
       if (parentId && String(parentId) !== idStr) {
-        const pIdStr = String(parentId);
+        pIdStr = String(parentId);
         
+        // 寻找该根评论的作者名字
+        const replyCommentId = c.reply_comment_id || c.reply_to_comment?.id || c.reply_to_comment_id;
+        if (replyAuthorName && String(replyCommentId) === pIdStr) {
+          placeholderAuthor = replyAuthorName;
+        } else {
+          // 兜底：从当前同属该根评论的兄弟评论里找被回复人
+          const anyReply = allFlatComments.find(
+            x => String(x.reply_comment_id || x.reply_to_comment?.id || x.reply_to_comment_id || x.reply_root_comment_id || x.root_comment_id) === pIdStr && (x.reply_to_author?.member?.name || x.reply_to_author?.name)
+          );
+          if (anyReply) placeholderAuthor = anyReply.reply_to_author?.member?.name || anyReply.reply_to_author?.name || '知乎用户';
+        }
+      } else if (replyAuthorName) {
+        // 兜底：若无明确 parentId，但有回复的作者，尝试在列表中找其对应的评论进行关联
+        const isCommonName = replyAuthorName === '匿名用户' || (replyAuthorName.startsWith('知乎用户') && replyAuthorName.length <= 6);
+        const matchingComment = allFlatComments.find(
+          x => getAuthorName(x) === replyAuthorName && (!isCommonName || String(x.id) !== idStr)
+        );
+        if (matchingComment) {
+          pIdStr = String(matchingComment.id);
+        } else {
+          // 若列表中也没有此作者的任何评论，说明该父评论已被删除/屏蔽，为该作者创建一个虚拟占位卡片
+          pIdStr = `deleted_parent_name_${replyAuthorName}`;
+          placeholderAuthor = replyAuthorName;
+          isSynthesized = true;
+        }
+      }
+      
+      if (pIdStr) {
         // 如果当前 commentMap 里没有它的父级评论
         if (!commentMap.has(pIdStr)) {
-          // 寻找该根评论的作者名字
-          let placeholderAuthor = '知乎用户';
-          const replyCommentId = c.reply_comment_id || c.reply_to_comment?.id || c.reply_to_comment_id;
-          const replyAuthorName = c.reply_to_author?.member?.name || c.reply_to_author?.name;
-          if (replyAuthorName && String(replyCommentId) === pIdStr) {
-            placeholderAuthor = replyAuthorName;
-          } else {
-            // 兜底：从当前同属该根评论的兄弟评论里找被回复人
-            const anyReply = allFlatComments.find(
-              x => String(x.reply_comment_id || x.reply_to_comment?.id || x.reply_to_comment_id || x.reply_root_comment_id || x.root_comment_id) === pIdStr && (x.reply_to_author?.member?.name || x.reply_to_author?.name)
-            );
-            if (anyReply) placeholderAuthor = anyReply.reply_to_author?.member?.name || anyReply.reply_to_author?.name || '知乎用户';
-          }
-          
           const virtualRoot = {
-            id: parentId,
-            content: `<span style="color:#ef4444;font-size:12px;opacity:0.85;font-style:italic;">⚠️ 原始主评论未在列表中载入（可能被知乎折叠或已删除）</span>`,
+            id: pIdStr,
+            content: isSynthesized 
+              ? `<span style="color:#9ca3af;font-style:italic;">⚠️ 该评论已被删除或屏蔽</span>`
+              : `<span style="color:#ef4444;font-size:12px;opacity:0.85;font-style:italic;">⚠️ 原始主评论未在列表中载入（可能被知乎折叠或已删除）</span>`,
             created_time: (c.created_time || 0) - 1, 
             vote_count: 0,
             child_comments_count: 1, 
@@ -1106,16 +1128,20 @@
       const parentIdStr = parentId ? String(parentId) : null;
       const rootCommentIdStr = (c.reply_root_comment_id || c.root_comment_id) ? String(c.reply_root_comment_id || c.root_comment_id) : null;
 
-      // 兜底：如果 API 没返回 parentId 但存在回复作者，尝试匹配当前列表中该作者的最后一条评论
+      // 确定实际要关联的父 ID
       let targetParentIdStr = parentIdStr;
-      if (!targetParentIdStr) {
+      if (!targetParentIdStr || !commentMap.has(targetParentIdStr)) {
         const replyAuthorName = c.reply_to_author?.member?.name || c.reply_to_author?.name;
         if (replyAuthorName) {
           const isCommonName = replyAuthorName === '匿名用户' || (replyAuthorName.startsWith('知乎用户') && replyAuthorName.length <= 6);
           const matchingComment = allFlatComments.find(
             x => getAuthorName(x) === replyAuthorName && (!isCommonName || String(x.id) !== idStr)
           );
-          if (matchingComment) targetParentIdStr = String(matchingComment.id);
+          if (matchingComment) {
+            targetParentIdStr = String(matchingComment.id);
+          } else {
+            targetParentIdStr = `deleted_parent_name_${replyAuthorName}`;
+          }
         }
       }
 
@@ -1306,7 +1332,7 @@ function buildCommentSection(json, answerId, startOffset) {
       }
     }
 
-    const time  = c.created_time ? new Date(c.created_time * 1000).toLocaleString('zh-CN') : '?';
+    const time  = (c.created_time && c.created_time > 0) ? new Date(c.created_time * 1000).toLocaleString('zh-CN') : '';
     const votes = c.vote_count ?? c.voteup_count ?? c.up_count ?? 0;
 
     const replyAuthorObj = c.reply_to_author;
@@ -1334,7 +1360,7 @@ function buildCommentSection(json, answerId, startOffset) {
           ? `<a class="zf-comment-author" href="${authorUrl}" target="_blank" rel="noopener">${authorName}</a>`
           : `<span class="zf-comment-author zf-author-anon">${authorName}</span>`
         }
-        <span class="zf-comment-time">${time}</span>
+        ${time ? `<span class="zf-comment-time">${time}</span>` : ''}
         ${votes > 0 ? `<span class="zf-comment-vote">👍 ${votes}</span>` : ''}
       </div>
       <div class="zf-comment-content"></div>
@@ -1708,7 +1734,7 @@ function buildCommentSection(json, answerId, startOffset) {
     el.id = 'zf-panel';
     el.innerHTML = `
       <h3 id="zf-title">
-        <span style="display: flex; align-items: center; gap: 4px;">🛠️ 知乎控制器 v1.0.1</span>
+        <span style="display: flex; align-items: center; gap: 4px;">🛠️ 知乎控制器 v${VERSION}</span>
         <div style="display: flex; align-items: center; gap: 8px;">
           <span id="zf-theme-toggle" style="cursor: pointer; font-size: 12px; transition: transform 0.2s;" title="切换配色">☀️</span>
           <span id="zf-collapse-indicator">▾</span>
@@ -1897,7 +1923,7 @@ function buildCommentSection(json, answerId, startOffset) {
     ov.id = 'zf-debug-overlay';
     ov.innerHTML = `
       <button id="zf-debug-close">✕</button>
-      <h4>🔍 ZhihuFetcher v1.0.1 调试面板</h4>
+      <h4>🔍 ZhihuFetcher v${VERSION} 调试面板</h4>
       <div class="dbg-sec">
         <div class="dbg-lbl">Hook 状态</div>
         <pre>fetch hook:    ${!!unsafeWindow.__ZF_FETCH_HOOKED__}
