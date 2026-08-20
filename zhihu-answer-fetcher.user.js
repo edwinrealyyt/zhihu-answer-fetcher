@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎控制器
 // @namespace    https://github.com/edwinrealyyt/zhihu-answer-fetcher
-// @version      1.0.3
+// @version      1.1.0
 // @description  知乎网页端太难用了，加载慢，排序乱，真得控制一下你了。知乎网页端回答与评论获取助手，告别手动加载刷新，支持回答按点赞数/时间排序。
 // @author       EdwinYyt
 // @license      MIT
@@ -16,7 +16,7 @@
 
   const QID = location.pathname.match(/\/question\/(\d+)/)?.[1];
   if (!QID) return;
-  const VERSION = '1.0.3';
+  const VERSION = '1.1.0';
 
   // 赞助收款码配置（支持在线图片 URL 或 Base64 编码，留空则显示配置提示）
   const WECHAT_QR = 'https://g.imgtg.com/uploads/10010/6a4c781c564cd.png';  // 微信收款码
@@ -32,7 +32,11 @@
   let totalAnswersCount = null;
   let isRequesting  = false;  // 防并发锁
   let activeRequests = 0;     // 当前活跃请求数
-  const MAX_CONCURRENCY = 2;  // 最大并发通道数
+  let dynConcurrency = 3;     // [自适应] 当前并发数
+  let dynDelay = 50;          // [自适应] 当前请求间隔(ms)
+  let successStreak = 0;      // [自适应] 连续成功次数
+  let pendingOffsets = [];    // 预计算的 offset 任务队列
+  let hasPrecalculated = false; // 是否已预计算过
   const failedOffsets = [];   // 失败重试队列
 
   // feeds API 状态（cursor 分页）
@@ -64,6 +68,9 @@
   let currentPage   = 1;
   let itemsPerPage  = 50;
   let showImages    = false;  // 图片默认不加载
+  let searchKeyword  = '';    // 搜索关键词
+  let filteredSorted = [];    // 搜索筛选后的列表
+  let allExpanded    = false; // 是否全部展开
 
   const ioTrackers = [];
   const debugFailedAuthors = [];
@@ -213,7 +220,7 @@
       console.log(`[ZF v1.0] 被动 +${batch.length} | 累计 ${rawAnswers.length}`);
       onBatchReceived(batch.length, rawAnswers.length, false, isFeeds ? '被动/feeds' : '被动/answers');
 
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise(r => setTimeout(r, 50));
       return realResp;
     };
 
@@ -237,6 +244,15 @@
     return item && item.type === 'answer' && item.voteup_count != null;
   }
 
+  // 基本 HTML 清理：移除 script 标签和内联事件处理器，防止 XSS
+  function sanitizeHTML(html) {
+    if (!html) return '';
+    return html
+      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+      .replace(/\bon\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+      .replace(/javascript\s*:/gi, '');
+  }
+
 
   // ═══════════════════════════════════════════════════════════
   // § 3. 直连 API
@@ -250,33 +266,70 @@
   async function tryDirectAnswers() {
     if (answersDone || !_origFetch || !capturedHdrs) return false;
     if (answersApiFailed >= 3) return false; // 连续失败 3 次则放弃
-    if (activeRequests >= MAX_CONCURRENCY) return false;
+    if (activeRequests >= dynConcurrency) return false;
+
+    // 预计算 offsets (3a)
+    if (!hasPrecalculated && totalAnswersCount > 0) {
+      for (let o = answersOffset; o < totalAnswersCount; o += 20) {
+        pendingOffsets.push(o);
+      }
+      hasPrecalculated = true;
+      console.log(`[ZF v1.0] 预计算完成，共生成 ${pendingOffsets.length} 个并发抓取任务`);
+    }
 
     activeRequests++;
 
-    // 优先从失败队列拉取，没有则使用最新的递增 offset
+    // 优先从失败队列拉取，没有则从预计算队列拉取，最后兜底递增
     let currentOffset;
     let isRetryingFailed = false;
     if (failedOffsets.length > 0) {
       currentOffset = failedOffsets.shift();
       isRetryingFailed = true;
-    } else {
+    } else if (pendingOffsets.length > 0) {
+      currentOffset = pendingOffsets.shift();
+    } else if (!hasPrecalculated) {
       currentOffset = answersOffset;
       answersOffset += 20; // 预增 20 条
+    } else {
+      activeRequests--;
+      return false;
     }
 
     const url = `https://www.zhihu.com/api/v4/questions/${QID}/answers`
       + `?include=${ANS_INCLUDE}&limit=20&offset=${currentOffset}&platform=desktop&sort_by=default`;
 
+    const startTime = Date.now();
     try {
       console.log(`[ZF v1.0] → answers API offset=${currentOffset}${isRetryingFailed ? ' (重试)' : ''}`);
       const resp = await _origFetch(url, { method: 'GET', headers: capturedHdrs, credentials: 'include', mode: 'cors' });
+      const latency = Date.now() - startTime;
 
       if (!resp.ok) {
-        console.warn(`[ZF v1.0] answers API HTTP ${resp.status}`);
+        // 自适应降速 (3c)
+        if (resp.status === 429 || resp.status === 403 || resp.status === 401) {
+          dynConcurrency = Math.max(1, Math.floor(dynConcurrency / 2));
+          dynDelay = Math.min(1000, dynDelay * 2);
+          successStreak = 0;
+          console.warn(`[ZF v1.0] 触发频控 HTTP ${resp.status}，大幅降速: 并发=${dynConcurrency}, 延迟=${dynDelay}ms`);
+        } else {
+          console.warn(`[ZF v1.0] answers API HTTP ${resp.status}`);
+        }
         answersApiFailed++;
         if (!isRetryingFailed) failedOffsets.push(currentOffset); // 压入重试队列
         return false;
+      }
+
+      // 自适应提速 (3c)
+      if (latency < 400) {
+        successStreak++;
+        if (successStreak > 10) {
+          dynConcurrency = Math.min(10, dynConcurrency + 1);
+          dynDelay = Math.max(20, dynDelay - 5);
+          successStreak = 0;
+          console.log(`[ZF v1.0] 网络良好，温和提速: 并发=${dynConcurrency}, 延迟=${dynDelay}ms`);
+        }
+      } else {
+        successStreak = 0;
       }
 
       const json = await resp.json();
@@ -293,9 +346,9 @@
         totalAnswersCount = parseInt(json.paging.totals, 10) || totalAnswersCount;
       }
 
-      // 到头判定：当前返回是 is_end，且没有积压的重试任务时，才算真正 Done
+      // 到头判定
       if (json.paging?.is_end || (batch.length === 0 && !isRetryingFailed)) {
-        if (failedOffsets.length === 0) {
+        if (failedOffsets.length === 0 && pendingOffsets.length === 0) {
           answersDone = true;
         }
       }
@@ -311,9 +364,12 @@
       return false;
     } finally {
       activeRequests--;
-      // 释放后立刻唤醒下一次调度，试图填满并发通道
+      if (hasPrecalculated && pendingOffsets.length === 0 && failedOffsets.length === 0 && activeRequests === 0) {
+        answersDone = true;
+      }
+      // 释放后立刻唤醒下一次调度
       if (isFetching && !answersDone) {
-        scheduleFetch(50);
+        scheduleFetch(dynDelay);
       }
     }
   }
@@ -382,13 +438,12 @@
 
       let startedAny = false;
 
-      // 循环填充并发通道（至多 MAX_CONCURRENCY 个并发请求）
-      while (activeRequests < MAX_CONCURRENCY && !answersDone && isFetching) {
-        const ansOk = await tryDirectAnswers();
-        if (!ansOk) break;
-        startedAny = true;
-        // 适当微小间隔（约 80ms），既可以极速并发，又能防止请求撞在同一毫秒内被安全风控判定
-        await new Promise(r => setTimeout(r, 80));
+      // 并发分发请求（fire-and-forget，不 await 等待响应，让多路请求真正并行飞行）
+      while (activeRequests < dynConcurrency && !answersDone && isFetching) {
+        // tryDirectAnswers 内部会立即 activeRequests++，请求完成后在 finally 中 activeRequests-- 并触发下一轮调度
+        tryDirectAnswers().then(ok => { if (ok) startedAny = true; });
+        // 微小错开，防止请求撞在同一毫秒
+        await new Promise(r => setTimeout(r, Math.max(10, dynDelay / 2)));
       }
 
       // 如果直连没有在运行（通道数为0）且备用 feeds 直连未做完，降级走 feeds
@@ -415,7 +470,7 @@
   }
 
   function startWatchdog() {
-    const POLL = 3000, TIMEOUT = 14000, MAX = 4;
+    const POLL = 3000, TIMEOUT = 10000, MAX = 4;
     watchdogTimer = setInterval(async () => {
       if (!isFetching) { clearInterval(watchdogTimer); return; }
       if (Date.now() - lastDataTs < TIMEOUT) return;
@@ -427,7 +482,7 @@
       unsafeWindow.scrollTo({ top: 0 });
       await new Promise(r => setTimeout(r, 300));
       fireAllIO();
-      scheduleFetch(400);
+      scheduleFetch(200);
     }, POLL);
   }
 
@@ -459,13 +514,13 @@
     } else if (isFetching) {
       const bg = document.hidden ? '📱 后台' : '⏳';
       updateStatus(`${bg} ${uniqueAnswers.length} 条（+${batchLen}）<br><small>${method}</small>`);
-      scheduleFetch(250);
+      scheduleFetch(120);
     }
   }
 
   function onRequestError(msg) {
     updateStatus(`❌ 请求出错: ${msg}`);
-    if (isFetching) scheduleFetch(3000);
+    if (isFetching) scheduleFetch(1500);
   }
 
   function onFetchComplete(isTimeout) {
@@ -516,8 +571,12 @@
     isFetching = true; retryCount = 0; cntDirect = 0; cntIO = 0;
     isRequesting = false;
     activeRequests = 0;
+    dynConcurrency = 3; dynDelay = 50; successStreak = 0;
+    pendingOffsets = []; hasPrecalculated = false;
     failedOffsets.length = 0;
-    rawAnswers = []; allAnswers = [];
+    rawAnswers = []; allAnswers = []; filteredSorted = []; searchKeyword = ''; allExpanded = false;
+    currentPage = 1;
+    debugFailedAuthors.length = 0;
     feedsNextUrl = null; feedsDone = false; feedsApiFailed = 0;
     answersOffset = 0; answersDone = false; answersApiFailed = 0;
     totalAnswersCount = getInitialAnswerCount();
@@ -529,14 +588,14 @@
     updateStatus('🚀 启动抓取...<br><small>可切换到其他标签页</small>');
 
     unsafeWindow.scrollTo({ top: 0 });
-    await new Promise(r => setTimeout(r, 400));
+    await new Promise(r => setTimeout(r, 200));
     lastDataTs = Date.now();
 
     // 首次触发三管齐下
     unsafeWindow.scrollTo({ top: document.body.scrollHeight });
     unsafeWindow.dispatchEvent(new Event('scroll'));
     fireAllIO();
-    scheduleFetch(500);
+    scheduleFetch(300);
     startWatchdog();
   }
 
@@ -618,8 +677,8 @@
       };
     }
     
-    // 3. 并发拉取剩余的评论页，控制并发数为 3
-    const CONCURRENCY = 3;
+    // 3. 并发拉取剩余的评论页，控制并发数为 4
+    const CONCURRENCY = 4;
     let activeRequests = 0;
     let cursor = 0;
     let hasError = false;
@@ -640,7 +699,7 @@
         activeRequests++;
         
         try {
-          await new Promise(r => setTimeout(r, 60)); // 错开微小延迟，防止触发知乎安全频控
+          await new Promise(r => setTimeout(r, 30)); // 错开微小延迟，防止触发知乎安全频控
           const json = await loadComments(answerId, currentOffset);
           const batch = json.data || [];
           resultsMap.set(currentOffset, batch);
@@ -696,15 +755,18 @@
       }
       reqCount++;
       if (!isEnd) {
-        await new Promise(r => setTimeout(r, 120));
+        await new Promise(r => setTimeout(r, 50));
       }
     }
     return allData;
   }
 
-  async function openReplyModal(commentId, commentAuthor, totalCount) {
-    // 废弃，已由一级弹窗后台自动全量补全和原样展现取代
-  }
+
+  // 统一的作者名字提取工具函数
+  const getAuthorName = (c) => {
+    if (!c || !c.author) return '知乎用户';
+    return c.author.member?.name || c.author.name || (c.author.role === 'anonymous' ? '匿名用户' : '知乎用户');
+  };
 
   async function openCommentModal(answerId, commentCount, authorName) {
     if (!capturedHdrs) {
@@ -748,7 +810,9 @@
     document.body.appendChild(modal);
     updateBodyScroll();
 
+    let escHandler;
     const closeModal = () => {
+      if (escHandler) document.removeEventListener('keydown', escHandler);
       modal.style.animation = 'zf-fade-in 0.15s ease-out reverse';
       container.style.animation = 'zf-scale-up 0.15s ease-out reverse';
       setTimeout(() => {
@@ -757,18 +821,15 @@
       }, 140);
     };
 
+    escHandler = (e) => {
+      if (e.key === 'Escape') closeModal();
+    };
+    document.addEventListener('keydown', escHandler);
+
     header.querySelector('.zf-modal-close-btn').onclick = closeModal;
     modal.onclick = (e) => {
       if (e.target === modal) closeModal();
     };
-
-    const escHandler = (e) => {
-      if (e.key === 'Escape') {
-        closeModal();
-        document.removeEventListener('keydown', escHandler);
-      }
-    };
-    document.addEventListener('keydown', escHandler);
 
     try {
       const updateModalProgress = (loaded, total) => {
@@ -785,239 +846,55 @@
 
       const json = await loadAllComments(answerId, updateModalProgress);
 
-      // 统一的名字获取器，兼容不同版本的接口作者名字封装
-      const getAuthorName = (c) => {
-        if (!c || !c.author) return '知乎用户';
-        return c.author.member?.name || c.author.name || (c.author.role === 'anonymous' ? 'anonymous' : '知乎用户');
-      };
-
-      // 1. 同步预整合扁平 Map，提取所有真实的和需要生成的虚拟根评论节点
       if (json.data && Array.isArray(json.data)) {
-        const flatCommentsMap = new Map();
-        const feedIntoMap = (c) => {
-          if (!c || !c.id) return;
-          const idStr = String(c.id);
-          if (!flatCommentsMap.has(idStr)) {
-            flatCommentsMap.set(idStr, c);
-          }
-          if (c.child_comments && Array.isArray(c.child_comments)) {
-            c.child_comments.forEach(feedIntoMap);
-          }
-        };
-        json.data.forEach(feedIntoMap);
-
-        const allFlatComments = Array.from(flatCommentsMap.values());
-        const commentMap = new Map();
-        allFlatComments.forEach(c => {
-          commentMap.set(String(c.id), c);
+        // 后台并发补全子评论 (使用自适应并发)
+        const rootsNeedingChildren = json.data.filter(c => {
+          const count = c.child_comments_count ?? c.child_comment_count ?? c.children_count ?? c.reply_count ?? 0;
+          return count > 0;
         });
 
-        // 探测出所有缺失的虚拟根评论对象 (如知乎已注销、删除的父 ID)
-        const virtualRootsMap = new Map();
-        allFlatComments.forEach(c => {
-          const idStr = String(c.id);
-          const parentId = c.reply_comment_id || c.reply_to_comment?.id || c.reply_to_comment_id || c.reply_root_comment_id || c.root_comment_id;
-          if (parentId && String(parentId) !== idStr) {
-            const pIdStr = String(parentId);
-            
-            if (!commentMap.has(pIdStr)) {
-              let placeholderAuthor = '知乎用户';
-              const replyCommentId = c.reply_comment_id || c.reply_to_comment?.id || c.reply_to_comment_id;
-              const replyAuthorName = c.reply_to_author?.member?.name || c.reply_to_author?.name;
-              if (replyAuthorName && String(replyCommentId) === pIdStr) {
-                placeholderAuthor = replyAuthorName;
-              } else {
-                const anyReply = allFlatComments.find(
-                  x => String(x.reply_comment_id || x.reply_to_comment?.id || x.reply_to_comment_id || x.reply_root_comment_id || x.root_comment_id) === pIdStr && (x.reply_to_author?.member?.name || x.reply_to_author?.name)
-                );
-                if (anyReply) placeholderAuthor = anyReply.reply_to_author?.member?.name || anyReply.reply_to_author?.name || '知乎用户';
-              }
+        if (rootsNeedingChildren.length > 0) {
+          const childConcurrency = Math.min(dynConcurrency, 4);
+          let childCursor = 0;
+          let childActive = 0;
 
-              // 预构建虚拟根节点加入 Map，以防丢失补全的扫描
-              const virtualRoot = {
-                id: parentId,
-                content: `<span style="color:#ef4444;font-size:12px;opacity:0.85;font-style:italic;">⚠️ 原始主评论未在列表中载入（可能被知乎折叠或已删除）</span>`,
-                created_time: (c.created_time || 0) - 1, 
-                vote_count: 0,
-                child_comments_count: 1, 
-                author: { member: { name: placeholderAuthor } },
-                _isVirtualPlaceholder: true,
-                child_comments: []
-              };
-              
-              commentMap.set(pIdStr, virtualRoot);
-              virtualRootsMap.set(pIdStr, virtualRoot);
-            }
-          }
-        });
-
-        // 2. 收集所有实锤含有子回复的根卡片 ID
-        // 采用双重检索：(A) 物理 ID 关联判定  (B) 物理 ID 缺失时的作者名字模糊关联判定 (用于知乎外置的高赞回复)
-        const rootIdsToFetch = new Set();
-        allFlatComments.forEach(c => {
-          const idStr = String(c.id);
-          
-          // 2.1 物理 ID 直接判定
-          const parentId = c.reply_comment_id || c.reply_to_comment?.id || c.reply_to_comment_id || c.reply_root_comment_id || c.root_comment_id;
-          if (parentId && String(parentId) !== idStr) {
-            rootIdsToFetch.add(String(parentId));
-            return;
-          }
-          
-          // 2.2 名字模糊判定兜底 (补齐外置子评论的关系网)
-          const replyAuthorName = c.reply_to_author?.member?.name || c.reply_to_author?.name;
-          if (replyAuthorName) {
-            const isCommonName = replyAuthorName === '匿名用户' || (replyAuthorName.startsWith('知乎用户') && replyAuthorName.length <= 6);
-            const matchingComment = allFlatComments.find(
-              x => getAuthorName(x) === replyAuthorName && (!isCommonName || String(x.id) !== idStr)
-            );
-            if (matchingComment) {
-              rootIdsToFetch.add(String(matchingComment.id));
-            }
-          }
-        });
-
-        const pendingNodes = [];
-        rootIdsToFetch.forEach(pIdStr => {
-          if (commentMap.has(pIdStr)) {
-            const targetNode = commentMap.get(pIdStr);
-            pendingNodes.push({
-              commentId: pIdStr,
-              targetNode: targetNode,
-              loadedCount: 0,
-              isVirtual: !!targetNode._isVirtualPlaceholder
-            });
-          }
-        });
-
-        // 3. 执行补全拉取
-        if (pendingNodes.length > 0) {
-          const totalNodes = pendingNodes.length;
-          const updateChildProgress = (comp, tot) => {
-            const textEl = document.getElementById('zf-modal-loading-text');
-            const barEl = document.getElementById('zf-modal-loading-bar');
-            const percentage = tot > 0 ? Math.min(100, Math.round((comp / tot) * 100)) : 0;
-            if (textEl) {
-              textEl.textContent = `⏳ 正在补全二级回复: ${comp} / ${tot} (${percentage}%)`;
-            }
-            if (barEl) {
-              barEl.style.width = `${percentage}%`;
-            }
-          };
-
-          updateChildProgress(0, totalNodes);
-          
-          let completed = 0;
-          let activeChildRequests = 0;
-          let cursor = 0;
-          
-          await new Promise((resolve) => {
-            const next = async () => {
-              if (cursor >= pendingNodes.length) {
-                if (activeChildRequests === 0) resolve();
+          await new Promise(resolve => {
+            const nextChild = async () => {
+              if (childCursor >= rootsNeedingChildren.length) {
+                if (childActive === 0) resolve();
                 return;
               }
-              
-              const node = pendingNodes[cursor++];
-              activeChildRequests++;
-              
+              const targetComment = rootsNeedingChildren[childCursor++];
+              childActive++;
               try {
-                const allChildData = [];
-                let isChildEnd = false;
-                let childOffset = 0; // 强行从 0 开始翻页拉取，防止因混合热度/时间排序差异导致的漏拉
-                let maxChildRequests = 15; // 最多拉取 300 条回复，防止无限刷
-                let childReqCount = 0;
-                
-                while (!isChildEnd && childReqCount < maxChildRequests) {
-                  const childJson = await loadChildComments(node.commentId, childOffset);
-                  if (childJson.data && Array.isArray(childJson.data)) {
-                    allChildData.push(...childJson.data);
-                  }
-                  isChildEnd = childJson.paging?.is_end ?? true;
-                  if (!isChildEnd) {
-                    childOffset += childJson.data?.length ?? 20;
-                  }
-                  childReqCount++;
-                  if (!isChildEnd) {
-                    await new Promise(r => setTimeout(r, 60)); // 频控保护
-                  }
+                const childData = await loadAllChildComments(targetComment.id);
+                if (childData.length > 0) {
+                  targetComment.child_comments = childData;
                 }
-                
-                if (!node.targetNode.child_comments) {
-                  node.targetNode.child_comments = [];
-                }
-                // 去重合入
-                const existingIds = new Set(node.targetNode.child_comments.map(x => String(x.id)));
-                allChildData.forEach(ch => {
-                  if (!existingIds.has(String(ch.id))) {
-                    node.targetNode.child_comments.push(ch);
-                  }
-                });
-
-                // 刷新子回复统计
-                node.targetNode.child_comments_count = node.targetNode.child_comments.length;
-                
-              } catch (err) {
-                console.warn('[ZF] 自动补全回复数据失败:', node.commentId, err);
+              } catch (e) {
+                console.warn('[ZF] Child comment load error:', e.message);
               } finally {
-                completed++;
-                activeChildRequests--;
-                updateChildProgress(completed, totalNodes);
-                next();
+                childActive--;
+                nextChild();
               }
             };
-            
-            // 采用并发度 2，安全稳定地高速拉取数据
-            for (let i = 0; i < Math.min(2, pendingNodes.length); i++) {
-              next();
-            }
+            for (let i = 0; i < childConcurrency; i++) nextChild();
           });
         }
 
-        // 把在预扫描里成功补全好数据的虚拟卡片们，也统一塞入 json.data 数组中，以便后续 buildCommentSection 能够渲染
-        virtualRootsMap.forEach((vRoot) => {
-          if (vRoot.child_comments && vRoot.child_comments.length > 0) {
-            json.data.push(vRoot);
-          }
-        });
+        // 4. 渲染评论
+        body.innerHTML = '';
+        const section = buildCommentSection(json, answerId, 0);
+        body.appendChild(section);
+      } else {
+        body.innerHTML = '<div style="padding:40px;text-align:center;color:#8e8e93;">暂无评论</div>';
       }
-
-      loadingDiv.remove();
-      const section = buildCommentSection(json, answerId, 0);
-      body.appendChild(section);
-    } catch (e) {
-      loadingDiv.innerHTML = `❌ 评论加载失败: ${e.message || e}<br><br><button class="zf-sort-btn" style="background:#7c3aed;color:#fff;padding:5px 12px;" id="zf-modal-retry">点击重试</button>`;
-      const retryBtn = loadingDiv.querySelector('#zf-modal-retry');
-      if (retryBtn) {
-        retryBtn.onclick = () => {
-          modal.remove();
-          updateBodyScroll();
-          document.removeEventListener('keydown', escHandler);
-          openCommentModal(answerId, commentCount, authorName);
-        };
-      }
-      console.error('[ZF v1.0] 评论加载失败:', e);
+    } catch (err) {
+      body.innerHTML = `<div style="padding:40px;color:red;text-align:center;">加载失败: ${err.message}</div>`;
     }
   }
 
-  // 统一的页面滚动控制器，防止弹窗滚动穿透到背景页面
-  function updateBodyScroll() {
-    const hasModal = document.querySelector('.zf-modal-mask') || document.getElementById('zf-comment-modal');
-    if (hasModal) {
-      document.body.style.overflow = 'hidden';
-    } else {
-      document.body.style.overflow = '';
-    }
-  }
-
-  // 辅助函数：根据知乎返回的扁平列表重组并渲染评论
   function renderGroupedComments(comments, listContainer, sortBy = 'default') {
-    // 统一的名字获取器，完美兼容 V4（c.author.name）与 V5（c.author.member.name）接口数据结构
-    const getAuthorName = (c) => {
-      if (!c || !c.author) return '知乎用户';
-      return c.author.member?.name || c.author.name || (c.author.role === 'anonymous' ? 'anonymous' : '知乎用户');
-    };
-
     // 1. 扁平化整合：由于知乎返回的 comments 中，每个评论对象可能都内嵌了 child_comments 列表
     // 为了进行彻底和正确的树状重组，我们把所有内嵌的子评论也提取出来，合并成一个包含所有评论的去重扁平数组
     const flatCommentsMap = new Map();
@@ -1352,7 +1229,7 @@ function buildCommentSection(json, answerId, startOffset) {
       }
     }
 
-    const content    = c.content ?? '';
+    const content    = sanitizeHTML(c.content ?? '');
 
     item.innerHTML = `
       <div class="zf-comment-meta">
@@ -1701,6 +1578,45 @@ function buildCommentSection(json, answerId, startOffset) {
     #zf-theme-toggle:hover {
       transform: scale(1.2);
     }
+    #zf-btn-export { background: #0369a1; color: #fff; }
+    #zf-panel.zf-theme-light #zf-btn-export { background: #0284c7; color: #fff; }
+
+    /* ── 搜索筛选 ── */
+    .zf-search-bar {
+      display: flex; gap: 8px; align-items: center; margin-bottom: 12px;
+    }
+    .zf-search-input {
+      flex: 1; padding: 8px 12px; border: 1px solid #e2e8f0;
+      border-radius: 8px; font-size: 13px; outline: none;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .zf-search-input:focus {
+      border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,0.1);
+    }
+    .zf-search-input::placeholder { color: #9ca3af; }
+    .zf-search-count { font-size: 12px; color: #6b7280; white-space: nowrap; }
+
+    /* ── 工具栏 ── */
+    .zf-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .zf-toolbar-btn {
+      padding: 5px 12px; border: 1px solid #e2e8f0; border-radius: 6px;
+      background: #f8fafc; cursor: pointer; font-size: 12px; color: #475569;
+      font-weight: 500; transition: all .15s; white-space: nowrap;
+    }
+    .zf-toolbar-btn:hover { background: #e2e8f0; color: #1e293b; }
+    .zf-toolbar-btn.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+
+    /* ── 键盘焦点 ── */
+    .zf-answer-card.zf-focused { outline: 2px solid #4f46e5; outline-offset: 2px; }
+
+    /* ── 搜索高亮 ── */
+    mark.zf-highlight { background: #fef08a; color: #1e293b; padding: 0 2px; border-radius: 2px; }
+
+    /* ── 快捷键提示 ── */
+    .zf-shortcut-hint {
+      font-size: 11px; color: #9ca3af; margin-left: auto;
+      white-space: nowrap;
+    }
   `);
 
 
@@ -1754,6 +1670,7 @@ function buildCommentSection(json, answerId, startOffset) {
         <div id="zf-progress"><div id="zf-progress-bar"></div></div>
         <div id="zf-count"></div>
         <div id="zf-status">⏳ 准备就绪<br><small>点击「获取所有回答」开始<br>支持切换到其他标签页</small></div>
+        <button id="zf-btn-export" disabled>📤 导出数据</button>
         <div style="display: flex; gap: 8px;">
           <button id="zf-btn-debug" style="flex: 1; margin: 0;">🔍 调试信息</button>
           <button id="zf-btn-donate" style="flex: 1; margin: 0; background: #b45309; color: #fff;">☕ 赞助支持</button>
@@ -1858,6 +1775,7 @@ function buildCommentSection(json, answerId, startOffset) {
     document.getElementById('zf-btn-restore').onclick= onRestore;
     document.getElementById('zf-btn-debug').onclick  = showDebug;
     document.getElementById('zf-btn-donate').onclick = showDonate;
+    document.getElementById('zf-btn-export').onclick = showExportMenu;
   }
 
   function addStopButton() {
@@ -1870,6 +1788,10 @@ function buildCommentSection(json, answerId, startOffset) {
   // ═══════════════════════════════════════════════════════════
   // § 7. 渲染与面板更新
   // ═══════════════════════════════════════════════════════════
+  function updateBodyScroll() {
+    document.body.style.overflow = document.querySelectorAll('.zf-modal-mask').length > 0 ? 'hidden' : '';
+  }
+
   function updateStatus(t) { const el = document.getElementById('zf-status'); if (el) el.innerHTML = t; }
   function updateCount(n) {
     const el = document.getElementById('zf-count');
@@ -1882,7 +1804,7 @@ function buildCommentSection(json, answerId, startOffset) {
     }
   }
   function setSortEnabled(on) {
-    ['zf-btn-votes','zf-btn-newest','zf-btn-oldest','zf-btn-restore'].forEach(id => {
+    ['zf-btn-votes','zf-btn-newest','zf-btn-oldest','zf-btn-restore','zf-btn-export'].forEach(id => {
       const b = document.getElementById(id); if (b) b.disabled = !on;
     });
   }
@@ -2035,6 +1957,7 @@ ${topDupsStr || '  (暂无重复回答)'}</pre>
     if (mode === 'newest') sorted.sort((a, b) => (b.created_time || 0) - (a.created_time || 0));
     if (mode === 'oldest') sorted.sort((a, b) => (a.created_time || 0) - (b.created_time || 0));
     currentSorted = sorted; currentPage = 1;
+    searchKeyword = ''; filteredSorted = [...sorted]; allExpanded = false;
     itemsPerPage  = Math.max(10, parseInt(document.getElementById('zf-per-page')?.value || '50', 10));
     const labels = { votes:'👍 赞同数降序', newest:'🕐 时间倒序', oldest:'🕑 时间正序' };
     initResultContainer(labels[mode]);
@@ -2074,6 +1997,15 @@ ${topDupsStr || '  (暂无重复回答)'}</pre>
         <span>🛠️ 脚本渲染（${modeLabel}）—— 共 ${currentSorted.length} 条 | 每页 ${itemsPerPage} 条</span>
         <button id="zf-img-toggle" class="zf-img-toggle">${showImages ? '🖼 隐藏图片' : '🖼 显示图片'}</button>
       </div>
+      <div class="zf-search-bar">
+        <input id="zf-search-input" class="zf-search-input" type="text" placeholder="🔍 搜索回答内容或作者名..." />
+        <span id="zf-search-count" class="zf-search-count">共 ${currentSorted.length} 条</span>
+      </div>
+      <div class="zf-toolbar">
+        <button id="zf-expand-all-btn" class="zf-toolbar-btn">📖 全部展开</button>
+        <button id="zf-export-inline-btn" class="zf-toolbar-btn">📤 导出数据</button>
+        <span class="zf-shortcut-hint">快捷键: J/K 上下 · Enter 展开 · C 评论 · ←→ 翻页</span>
+      </div>
       <div id="zf-pg-top"></div>
       <div id="zf-cards"></div>
       <div id="zf-pg-bot"></div>
@@ -2106,21 +2038,46 @@ ${topDupsStr || '  (暂无重复回答)'}</pre>
         });
       }
     };
+
+    // 搜索框事件绑定（带 250ms 防抖）
+    const searchInput = document.getElementById('zf-search-input');
+    if (searchInput) {
+      let searchTimer = null;
+      searchInput.oninput = () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => applySearch(searchInput.value), 250);
+      };
+      searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { searchInput.value = ''; applySearch(''); searchInput.blur(); }
+      });
+    }
+
+    // 全部展开按钮
+    document.getElementById('zf-expand-all-btn')?.addEventListener('click', toggleExpandAll);
+
+    // 工具栏内的导出按钮
+    document.getElementById('zf-export-inline-btn')?.addEventListener('click', showExportMenu);
   }
 
   function renderPage(page) {
-    const total = currentSorted.length;
-    const totalPages = Math.ceil(total / itemsPerPage);
+    const displayList = getDisplayList();
+    const total = displayList.length;
+    const totalPages = Math.ceil(total / itemsPerPage) || 1;
     page = Math.max(1, Math.min(page, totalPages));
     currentPage = page;
     const start = (page - 1) * itemsPerPage;
-    const slice = currentSorted.slice(start, start + itemsPerPage);
+    const slice = displayList.slice(start, start + itemsPerPage);
     const cards = document.getElementById('zf-cards');
     if (!cards) return;
     cards.innerHTML = '';
     const frag = document.createDocumentFragment();
     slice.forEach((ans, i) => frag.appendChild(buildCard(ans, start + i)));
     cards.appendChild(frag);
+    // 翻页后自动保持全展开状态
+    if (allExpanded) {
+      cards.querySelectorAll('.zf-answer-content.collapsed').forEach(el => el.classList.remove('collapsed'));
+      cards.querySelectorAll('.zf-expand-btn').forEach(btn => { btn.textContent = '▲ 收起'; });
+    }
     const pgHTML = buildPaginationHTML(page, totalPages, total);
     ['zf-pg-top', 'zf-pg-bot'].forEach(id => {
       const el = document.getElementById(id); if (!el) return;
@@ -2284,7 +2241,7 @@ ${topDupsStr || '  (暂无重复回答)'}</pre>
       origMainCol = null;
     }
 
-    currentSorted = []; currentPage = 1;
+    currentSorted = []; filteredSorted = []; searchKeyword = ''; allExpanded = false; currentPage = 1;
     updateStatus('✅ 已恢复原始页面');
     setSortEnabled(allAnswers.length > 0);
   }
@@ -2307,5 +2264,259 @@ ${topDupsStr || '  (暂无重复回答)'}</pre>
     }
   });
 
-  console.log(`[ZhihuFetcher] v1.0.1 初始化完成，QID=${QID}`);
+
+  // ═══════════════════════════════════════════════════════════
+  // § 13. 搜索筛选
+  // ═══════════════════════════════════════════════════════════
+  function getDisplayList() {
+    return searchKeyword ? filteredSorted : currentSorted;
+  }
+
+  function applySearch(keyword) {
+    searchKeyword = keyword.trim().toLowerCase();
+    if (!searchKeyword) {
+      filteredSorted = [...currentSorted];
+    } else {
+      filteredSorted = currentSorted.filter(ans => {
+        const rawText = (ans.content || ans.excerpt || '').replace(/<[^>]+>/g, '').toLowerCase();
+        const author = (ans.author?.name || '').toLowerCase();
+        return rawText.includes(searchKeyword) || author.includes(searchKeyword);
+      });
+    }
+    currentPage = 1;
+    updateSearchCount();
+    renderPage(1);
+  }
+
+  function updateSearchCount() {
+    const el = document.getElementById('zf-search-count');
+    if (!el) return;
+    if (searchKeyword) {
+      el.textContent = `匹配 ${filteredSorted.length} / ${currentSorted.length} 条`;
+      el.style.color = filteredSorted.length > 0 ? '#059669' : '#dc2626';
+    } else {
+      el.textContent = `共 ${currentSorted.length} 条`;
+      el.style.color = '#6b7280';
+    }
+  }
+
+
+  // ═══════════════════════════════════════════════════════════
+  // § 14. 一键全部展开 / 收起
+  // ═══════════════════════════════════════════════════════════
+  function toggleExpandAll() {
+    allExpanded = !allExpanded;
+    const cards = document.getElementById('zf-cards');
+    if (!cards) return;
+    cards.querySelectorAll('.zf-answer-content').forEach(el => {
+      el.classList.toggle('collapsed', !allExpanded);
+    });
+    cards.querySelectorAll('.zf-expand-btn').forEach(btn => {
+      btn.textContent = allExpanded ? '▲ 收起' : '▼ 展开全文';
+    });
+    const toggleBtn = document.getElementById('zf-expand-all-btn');
+    if (toggleBtn) {
+      toggleBtn.textContent = allExpanded ? '📖 全部收起' : '📖 全部展开';
+      toggleBtn.classList.toggle('active', allExpanded);
+    }
+  }
+
+
+  // ═══════════════════════════════════════════════════════════
+  // § 15. 数据导出（JSON / CSV / Markdown）
+  // ═══════════════════════════════════════════════════════════
+  function showExportMenu() {
+    document.getElementById('zf-export-modal')?.remove();
+
+    const data = getDisplayList();
+    if (!data.length) { updateStatus('❌ 没有可导出的数据，请先获取并排序回答'); return; }
+
+    const modal = document.createElement('div');
+    modal.id = 'zf-export-modal';
+    modal.className = 'zf-modal-mask';
+
+    const container = document.createElement('div');
+    container.style.cssText = 'background:#fff; border-radius:16px; padding:24px; width:360px; max-width:90vw; box-shadow:0 20px 25px -5px rgba(0,0,0,.1); animation:zf-scale-up .25s cubic-bezier(.34,1.56,.64,1);';
+
+    container.innerHTML = `
+      <h4 style="margin:0 0 16px; font-size:16px; font-weight:bold; color:#0f172a; text-align:center;">📤 导出数据</h4>
+      <p style="margin:0 0 16px; font-size:13px; color:#64748b; text-align:center;">
+        当前共 ${data.length} 条回答${searchKeyword ? '（已按关键词筛选）' : ''}
+      </p>
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        <button class="zf-export-opt" data-fmt="json" style="padding:10px 16px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; cursor:pointer; text-align:left; font-size:13px; transition:all .15s;">
+          <strong>📋 JSON</strong><br><span style="font-size:11px; color:#64748b;">完整结构化数据，适合程序处理</span>
+        </button>
+        <button class="zf-export-opt" data-fmt="csv" style="padding:10px 16px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; cursor:pointer; text-align:left; font-size:13px; transition:all .15s;">
+          <strong>📊 CSV</strong><br><span style="font-size:11px; color:#64748b;">表格格式，可用 Excel / WPS 打开</span>
+        </button>
+        <button class="zf-export-opt" data-fmt="markdown" style="padding:10px 16px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; cursor:pointer; text-align:left; font-size:13px; transition:all .15s;">
+          <strong>📝 Markdown</strong><br><span style="font-size:11px; color:#64748b;">富文本格式，适合 Obsidian / Notion 等笔记</span>
+        </button>
+      </div>
+    `;
+
+    modal.appendChild(container);
+    document.body.appendChild(modal);
+    updateBodyScroll();
+
+    let escHandler;
+    const closeModal = () => {
+      if (escHandler) document.removeEventListener('keydown', escHandler);
+      modal.remove();
+      updateBodyScroll();
+    };
+    modal.onclick = (e) => { if (e.target === modal) closeModal(); };
+
+    container.querySelectorAll('.zf-export-opt').forEach(btn => {
+      btn.onmouseenter = () => { btn.style.background = '#eef2ff'; btn.style.borderColor = '#c7d2fe'; };
+      btn.onmouseleave = () => { btn.style.background = '#f8fafc'; btn.style.borderColor = '#e2e8f0'; };
+      btn.onclick = () => {
+        exportData(btn.dataset.fmt, data);
+        closeModal();
+      };
+    });
+
+    escHandler = (e) => {
+      if (e.key === 'Escape') closeModal();
+    };
+    document.addEventListener('keydown', escHandler);
+  }
+
+  function exportData(format, data) {
+    let content, filename, mime;
+    const ts = new Date().toISOString().slice(0, 10);
+
+    if (format === 'json') {
+      const exportArr = data.map((a, i) => ({
+        rank: i + 1,
+        id: a.id,
+        author: a.author?.name || '匿名用户',
+        author_url: a.author?.url_token ? `https://www.zhihu.com/people/${a.author.url_token}` : '',
+        voteup_count: a.voteup_count || 0,
+        comment_count: a.comment_count || 0,
+        created_time: a.created_time ? new Date(a.created_time * 1000).toISOString() : '',
+        url: `https://www.zhihu.com/question/${QID}/answer/${a.id}`,
+        content: (a.content || '').replace(/<[^>]+>/g, ''),
+        excerpt: a.excerpt || ''
+      }));
+      content = JSON.stringify(exportArr, null, 2);
+      filename = `zhihu_Q${QID}_${data.length}条_${ts}.json`;
+      mime = 'application/json';
+    } else if (format === 'csv') {
+      const headers = ['排名', '作者', '赞同数', '评论数', '发布时间', '链接', '内容摘要'];
+      const rows = data.map((a, i) => {
+        const author = (a.author?.name || '匿名用户').replace(/"/g, '""');
+        const time = a.created_time ? new Date(a.created_time * 1000).toLocaleString('zh-CN') : '';
+        const url = `https://www.zhihu.com/question/${QID}/answer/${a.id}`;
+        const excerpt = (a.excerpt || a.content || '').replace(/<[^>]+>/g, '').slice(0, 300).replace(/"/g, '""').replace(/\n/g, ' ');
+        return `${i + 1},"${author}",${a.voteup_count || 0},${a.comment_count || 0},"${time}","${url}","${excerpt}"`;
+      });
+      content = '\uFEFF' + headers.join(',') + '\n' + rows.join('\n');
+      filename = `zhihu_Q${QID}_${data.length}条_${ts}.csv`;
+      mime = 'text/csv;charset=utf-8';
+    } else if (format === 'markdown') {
+      const lines = data.map((a, i) => {
+        const author = a.author?.name || '匿名用户';
+        const time = a.created_time ? new Date(a.created_time * 1000).toLocaleString('zh-CN') : '';
+        const url = `https://www.zhihu.com/question/${QID}/answer/${a.id}`;
+        const text = (a.content || a.excerpt || '').replace(/<[^>]+>/g, '').replace(/\n{3,}/g, '\n\n');
+        return `## #${i + 1} ${author}（👍 ${(a.voteup_count || 0).toLocaleString()}）\n\n> 🕐 ${time} | 💬 ${a.comment_count || 0} 条评论 | [原文链接](${url})\n\n${text}\n\n---\n`;
+      });
+      content = `# 知乎问题 Q${QID} 回答合集\n\n> 共 ${data.length} 条回答 | 导出时间: ${new Date().toLocaleString('zh-CN')}\n\n---\n\n` + lines.join('\n');
+      filename = `zhihu_Q${QID}_${data.length}条_${ts}.md`;
+      mime = 'text/markdown;charset=utf-8';
+    }
+
+    const blob = new Blob([content], { type: mime });
+    const dlUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = dlUrl; a.download = filename;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(dlUrl); }, 100);
+    updateStatus(`✅ 已导出 ${format.toUpperCase()} (${data.length} 条)`);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════
+  // § 16. 键盘快捷键导航
+  // ═══════════════════════════════════════════════════════════
+  document.addEventListener('keydown', (e) => {
+    // 输入框内不触发
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) || e.target.isContentEditable) return;
+    // 弹窗打开时不触发
+    if (document.querySelector('.zf-modal-mask') || document.getElementById('zf-export-modal')) return;
+    // 没有渲染结果时不触发
+    if (!document.getElementById('zf-cards')) return;
+
+    const cards = document.querySelectorAll('#zf-cards .zf-answer-card');
+    const focused = document.querySelector('.zf-answer-card.zf-focused');
+    let focusedIdx = focused ? Array.from(cards).indexOf(focused) : -1;
+
+    switch (e.key.toLowerCase()) {
+      case 'j': { // 下一条回答
+        e.preventDefault();
+        const nextIdx = focusedIdx + 1;
+        if (nextIdx < cards.length) {
+          focused?.classList.remove('zf-focused');
+          cards[nextIdx].classList.add('zf-focused');
+          cards[nextIdx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        break;
+      }
+      case 'k': { // 上一条回答
+        e.preventDefault();
+        if (focusedIdx > 0) {
+          focused?.classList.remove('zf-focused');
+          cards[focusedIdx - 1].classList.add('zf-focused');
+          cards[focusedIdx - 1].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else if (focusedIdx === -1 && cards.length) {
+          cards[0].classList.add('zf-focused');
+          cards[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        break;
+      }
+      case 'enter': { // 展开/收起当前回答
+        if (focused) {
+          e.preventDefault();
+          const expandBtn = focused.querySelector('.zf-expand-btn');
+          if (expandBtn) expandBtn.click();
+        }
+        break;
+      }
+      case 'c': { // 打开评论弹窗
+        if (focused) {
+          e.preventDefault();
+          const commentBtn = focused.querySelector('.zf-comment-btn');
+          if (commentBtn) commentBtn.click();
+        }
+        break;
+      }
+      case 'arrowleft': { // 上一页
+        if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          if (currentPage > 1) {
+            renderPage(currentPage - 1);
+            resultEl?.scrollIntoView({ behavior: 'smooth' });
+          }
+        }
+        break;
+      }
+      case 'arrowright': { // 下一页
+        if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          const displayList = getDisplayList();
+          const totalPages = Math.ceil(displayList.length / itemsPerPage) || 1;
+          if (currentPage < totalPages) {
+            renderPage(currentPage + 1);
+            resultEl?.scrollIntoView({ behavior: 'smooth' });
+          }
+        }
+        break;
+      }
+    }
+  });
+
+
+  console.log(`[ZhihuFetcher] v${VERSION} 初始化完成，QID=${QID}`);
 })();
